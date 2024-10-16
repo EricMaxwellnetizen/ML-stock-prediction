@@ -1,0 +1,169 @@
+import requests
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import matplotlib.pyplot as plt
+import keras_tuner as kt
+import talib
+
+# Step 1: Fetch Social Sentiment using StockTwits API
+def get_stocktwits_sentiment(symbol):
+    url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+    }
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json()
+        # Extract messages and sentiment based on message type
+        messages = data['messages']
+        sentiment_scores = {'bullish': 0, 'bearish': 0, 'neutral': 0}
+        for message in messages:
+            if 'entities' in message and 'sentiment' in message['entities']:
+                sentiment = message['entities']['sentiment']
+                if sentiment:
+                    if sentiment['basic'] == 'Bullish':
+                        sentiment_scores['bullish'] += 1
+                    elif sentiment['basic'] == 'Bearish':
+                        sentiment_scores['bearish'] += 1
+            else:
+                sentiment_scores['neutral'] += 1
+
+        # Calculate percentage of each sentiment
+        total = sum(sentiment_scores.values())
+        if total > 0:
+            for sentiment in sentiment_scores:
+                sentiment_scores[sentiment] = (sentiment_scores[sentiment] / total) * 100
+        return sentiment_scores
+    else:
+        print(f"Failed to fetch data. Status code: {response.status_code}")
+        print(f"Response content: {response.content}")
+        return None
+
+
+
+# Step 2: Fetch Historical Stock Data using Yahoo Finance
+def get_stock_data(symbol, start_date, end_date):
+    stock_data = yf.download(symbol, start=start_date, end=end_date)
+    return stock_data
+
+# Step 3: Add Technical Indicators (RSI, MACD, Moving Averages)
+def add_technical_indicators(data):
+    data['RSI'] = talib.RSI(data['Close'].values, timeperiod=14)
+    data['MACD'], data['MACD_Signal'], data['MACD_Hist'] = talib.MACD(data['Close'].values,
+                                                                      fastperiod=12, slowperiod=26, signalperiod=9)
+    data['SMA_50'] = talib.SMA(data['Close'].values, timeperiod=50)
+    data['SMA_200'] = talib.SMA(data['Close'].values, timeperiod=200)
+    return data.dropna()
+
+# Step 4: Prepare Data for LSTM (Add Sentiment as a Feature)
+def prepare_data(stock_data, sentiment_scores):
+    # Scale stock prices
+    close_scaler = MinMaxScaler(feature_range=(0, 1))
+    close_scaled_data = close_scaler.fit_transform(stock_data[['Close']])
+
+    # Scale other technical indicators
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(stock_data[['RSI', 'MACD', 'MACD_Signal', 'SMA_50', 'SMA_200']])
+
+    # Combine scaled close prices and technical indicators
+    full_scaled_data = np.concatenate((close_scaled_data, scaled_data), axis=1)
+
+    # Create sentiment feature (use Bullish sentiment percentage as an indicator)
+    sentiment_feature = np.full((len(full_scaled_data), 1), sentiment_scores['bullish'] / 100)
+
+    # Prepare LSTM data with sentiment as an additional feature
+    sequence_length = 60
+    X, y = [], []
+    for i in range(sequence_length, len(full_scaled_data)):
+        X.append(np.concatenate((full_scaled_data[i-sequence_length:i], sentiment_feature[i-sequence_length:i]), axis=1))
+        y.append(close_scaled_data[i, 0])  # 'Close' price is the target
+    X, y = np.array(X), np.array(y)
+
+    return X, y, close_scaler
+
+
+# Step 5: Define LSTM Model with Hyperparameter Tuning using KerasTuner
+def build_lstm_model(hp):
+    model = Sequential()
+    model.add(LSTM(units=hp.Int('units', min_value=50, max_value=200, step=50),
+                   return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])))
+    model.add(Dropout(hp.Float('dropout', min_value=0.1, max_value=0.5, step=0.1)))
+    model.add(LSTM(units=hp.Int('units', min_value=50, max_value=200, step=50), return_sequences=False))
+    model.add(Dropout(hp.Float('dropout', min_value=0.1, max_value=0.5, step=0.1)))
+    model.add(Dense(units=1))  # Predict stock price
+    model.compile(optimizer=hp.Choice('optimizer', values=['adam', 'rmsprop']),
+                  loss='mean_squared_error')
+    return model
+
+# Step 6: Hyperparameter Tuning with KerasTuner
+def tune_model(X_train, y_train):
+    tuner = kt.RandomSearch(
+        build_lstm_model,
+        objective='val_loss',
+        max_trials=5,
+        executions_per_trial=1,
+        directory='my_dir',
+        project_name='stock_price_lstm_with_tech_sentiment'
+    )
+
+    tuner.search(X_train, y_train, epochs=10, validation_split=0.2, batch_size=32)
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    return best_hps, tuner
+
+# Step 7: Train and Predict using Best Hyperparameters
+def train_and_predict_lstm(X_train, y_train, X_test, best_hps, tuner, close_scaler):
+    best_model = tuner.hypermodel.build(best_hps)
+    best_model.fit(X_train, y_train, epochs=25, batch_size=32)
+
+    # Predict on test data
+    predictions = best_model.predict(X_test)
+
+    # Since we are only predicting the 'Close' price, use a separate scaler for it
+    predictions = close_scaler.inverse_transform(predictions.reshape(-1, 1))
+
+    return predictions
+
+
+# Step 8: Plot Results
+def plot_results(stock_data, predictions, train_size):
+    plt.figure(figsize=(14, 7))
+    plt.plot(stock_data['Close'].values, label="True Stock Price", color='blue')
+    plt.plot(np.arange(train_size, train_size + len(predictions)), predictions, label="Predicted Stock Price", color='orange')
+    plt.title("Stock Price Prediction vs Actual")
+    plt.xlabel("Days")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.show()
+
+# Example Usage:
+# Fetch sentiment for Tesla ($TSLA)
+sentiment_scores = get_stocktwits_sentiment('TSLA')
+print(f"Sentiment Scores: {sentiment_scores}")
+
+# Fetch historical stock data for Tesla
+stock_data = get_stock_data('TSLA', start_date='2020-01-01', end_date='2023-01-01')
+
+# Add technical indicators to stock data
+stock_data = add_technical_indicators(stock_data)
+
+# Prepare data with sentiment integrated
+X, y, scaler = prepare_data(stock_data, sentiment_scores)
+
+# Train-test split (80% train, 20% test)
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
+
+# Tune LSTM model with KerasTuner
+best_hps, tuner = tune_model(X_train, y_train)
+
+# Train and predict using the best hyperparameters
+predictions = train_and_predict_lstm(X_train, y_train, X_test, best_hps, tuner, scaler)
+
+# Plot the results
+plot_results(stock_data, predictions, train_size)
